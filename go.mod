@@ -1,6 +1,12 @@
 module github.com/f5devcentral/bigip-kubernetes-gateway
 
-go 1.19
+go 1.21
+
+// Local patch, not upstream -- see third_party/gateway-api-v1.0.0-patched/apis/v1/
+// supportedfeature_unmarshal_patch.go for why. Bumping the real dependency cascades into a
+// controller-runtime/client-go upgrade with its own breakage (tried twice, both failed to build);
+// this keeps everything else pinned at its known-working v1.0.0-era version.
+replace sigs.k8s.io/gateway-api => ./third_party/gateway-api-v1.0.0-patched
 
 require (
 	github.com/f5devcentral/f5-bigip-rest-go v1.2.8
@@ -21,6 +27,7 @@ require (
 	github.com/cespare/xxhash/v2 v2.2.0 // indirect
 	github.com/davecgh/go-spew v1.1.1 // indirect
 	github.com/emicklei/go-restful/v3 v3.11.0 // indirect
+	github.com/evanphx/json-patch v5.7.0+incompatible // indirect
 	github.com/evanphx/json-patch/v5 v5.7.0 // indirect
 	github.com/fsnotify/fsnotify v1.7.0 // indirect
 	github.com/go-logr/logr v1.2.4 // indirect

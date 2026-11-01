@@ -5,11 +5,14 @@ import (
 	"fmt"
 	"os"
 	"reflect"
+	"sort"
+	"strings"
 	"time"
 
 	"github.com/f5devcentral/bigip-kubernetes-gateway/internal/k8s"
 	"github.com/f5devcentral/f5-bigip-rest-go/utils"
 	v1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/client-go/kubernetes"
 	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -37,8 +40,15 @@ func (c *SIGCache) UnsetNamespace(keyname string) {
 }
 
 func (c *SIGCache) GetNamespace(keyname string) *v1.Namespace {
-	c.mutex.Lock()
-	defer c.mutex.Unlock()
+	// Was Lock()/Unlock() (a write lock) for a pure read -- confirmed live as one half of a real
+	// deadlock: this is called extremely frequently (every parseGateway pass, every RouteMatches
+	// check), and Go's sync.RWMutex blocks ALL new readers the moment any writer is queued, so an
+	// unnecessary write-lock request here regularly queued up behind (and got queued behind by)
+	// other goroutines' legitimate read locks, including one nested inside another already-held
+	// read lock elsewhere in this cache (see hrParentName/_hrParentName's own doc comment for that
+	// other half). Read-only access only ever needs RLock.
+	c.mutex.RLock()
+	defer c.mutex.RUnlock()
 
 	return c.Namespace[keyname]
 }
@@ -87,6 +97,29 @@ func (c *SIGCache) GetGateway(keyname string) *gatewayapi.Gateway {
 	defer c.mutex.RUnlock()
 
 	return c.Gateway[keyname]
+}
+
+func (c *SIGCache) SetListenerSet(obj *gatewayapi.ListenerSet) {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+
+	if obj != nil {
+		c.ListenerSet[utils.Keyname(obj.Namespace, obj.Name)] = obj
+	}
+}
+
+func (c *SIGCache) UnsetListenerSet(keyname string) {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+
+	delete(c.ListenerSet, keyname)
+}
+
+func (c *SIGCache) GetListenerSet(keyname string) *gatewayapi.ListenerSet {
+	c.mutex.RLock()
+	defer c.mutex.RUnlock()
+
+	return c.ListenerSet[keyname]
 }
 
 func (c *SIGCache) SetHTTPRoute(obj *gatewayapi.HTTPRoute) {
@@ -265,27 +298,166 @@ func (c *SIGCache) _gatewayRefsOfHR(hr *gatewayapi.HTTPRoute) []*gatewayapi.Gate
 		return []*gatewayapi.Gateway{}
 	}
 	gws := []*gatewayapi.Gateway{}
-	for _, pr := range hr.Spec.ParentRefs {
-		ns := hr.Namespace
-		if pr.Namespace != nil {
-			ns = string(*pr.Namespace)
-		}
-		name := utils.Keyname(utils.Keyname(ns, string(pr.Name)))
-		if gw, ok := c.Gateway[name]; ok {
-			for _, listener := range gw.Spec.Listeners {
-				if listener.Name != *pr.SectionName {
-					continue
-				}
-				routetype := reflect.TypeOf(*hr).Name()
-				if RouteMatches(gw.Namespace, &listener, c.Namespace[hr.Namespace], routetype) {
-					gws = append(gws, gw)
-					break
-				}
-			}
-
+	for i := range hr.Spec.ParentRefs {
+		if gw, attached := c._parentRefTarget(hr, &hr.Spec.ParentRefs[i]); attached {
+			gws = append(gws, gw)
 		}
 	}
 	return gws
+}
+
+// ParentRefTarget resolves one of hr's parentRefs (a Gateway, or a ListenerSet standing in for
+// its parent Gateway) to the Gateway it ultimately targets -- nil if that isn't cached -- and
+// whether any listener it names actually accepts this route (sectionName, allowedRoutes).
+func (c *SIGCache) ParentRefTarget(hr *gatewayapi.HTTPRoute, pr *gatewayapi.ParentReference) (*gatewayapi.Gateway, bool) {
+	c.mutex.RLock()
+	defer c.mutex.RUnlock()
+	return c._parentRefTarget(hr, pr)
+}
+
+func (c *SIGCache) _parentRefTarget(hr *gatewayapi.HTTPRoute, pr *gatewayapi.ParentReference) (*gatewayapi.Gateway, bool) {
+	ns := hr.Namespace
+	if pr.Namespace != nil {
+		ns = string(*pr.Namespace)
+	}
+
+	// A parentRef can target a Gateway directly, or a ListenerSet attached to one (see
+	// ListenerSet's own doc comment) -- resolve to the actual Gateway either way, and check
+	// against whichever object's own listeners the parentRef's sectionName is scoped to (the
+	// ListenerSet's own, not the Gateway's, when going through one). refNamespace is what
+	// RouteMatches treats as "the Gateway's own namespace" for AllowedRoutes' "Same" case --
+	// per ListenerSet's own ReferenceGrant-semantics doc comment ("A ListenerSet can
+	// reference secrets/backends in its own namespace without a ReferenceGrant"), that's the
+	// ListenerSet's namespace, not necessarily the Gateway's, when going through one.
+	var gw *gatewayapi.Gateway
+	var candidateListeners []gatewayapi.Listener
+	refNamespace := ""
+	if pr.Kind != nil && string(*pr.Kind) == "ListenerSet" {
+		if ls := c.ListenerSet[utils.Keyname(ns, string(pr.Name))]; ls != nil {
+			gw = c._gatewayRefOfListenerSet(ls)
+			candidateListeners = ls.Spec.Listeners
+			refNamespace = ls.Namespace
+		}
+	} else if candidate, ok := c.Gateway[utils.Keyname(ns, string(pr.Name))]; ok {
+		gw = candidate
+		candidateListeners = candidate.Spec.Listeners
+		refNamespace = candidate.Namespace
+	}
+	if gw == nil {
+		return nil, false
+	}
+
+	for _, listener := range candidateListeners {
+		// SectionName is optional per the Gateway API spec -- nil means "matches any
+		// listener", not "matches none". Dereferencing it unconditionally here panicked
+		// (nil pointer deref) for ANY HTTPRoute anywhere in the cluster whose parentRef
+		// omits it, which is normal/valid and is how every Cilium-targeted HTTPRoute in
+		// this repo is written (this controller's own parser.go requires sectionName for
+		// routes attaching to ITS OWN GatewayClass, but this cache-lookup path runs for
+		// every Service's Endpoints changes cluster-wide, regardless of GatewayClass, so
+		// it can't assume that same constraint holds). Confirmed live: crashed the pod
+		// (CrashLoopBackOff) on an Endpoints event for a Service wholly unrelated to
+		// this controller's own Gateways.
+		if pr.SectionName != nil && listener.Name != *pr.SectionName {
+			continue
+		}
+		routetype := reflect.TypeOf(*hr).Name()
+		if RouteMatches(refNamespace, &listener, c.Namespace[hr.Namespace], routetype) {
+			return gw, true
+		}
+	}
+	return gw, false
+}
+
+// HTTPRoutesReferencingClass returns every cached HTTPRoute with at least one parentRef that
+// resolves to a Gateway of class className -- attached or not, so status can also report routes
+// a listener refuses (NotAllowedByListeners), which AttachedHTTPRoutes leaves out.
+func (c *SIGCache) HTTPRoutesReferencingClass(className string) []*gatewayapi.HTTPRoute {
+	c.mutex.RLock()
+	defer c.mutex.RUnlock()
+
+	hrs := []*gatewayapi.HTTPRoute{}
+	for _, hr := range c.HTTPRoute {
+		for i := range hr.Spec.ParentRefs {
+			if gw, _ := c._parentRefTarget(hr, &hr.Spec.ParentRefs[i]); gw != nil && string(gw.Spec.GatewayClassName) == className {
+				hrs = append(hrs, hr)
+				break
+			}
+		}
+	}
+	return hrs
+}
+
+// ListenerSetsReferencingGateway returns every cached ListenerSet whose parentRef names gw,
+// whether or not gw's allowedListeners actually admits it (AttachedListenerSets decides that).
+func (c *SIGCache) ListenerSetsReferencingGateway(gw *gatewayapi.Gateway) []*gatewayapi.ListenerSet {
+	c.mutex.RLock()
+	defer c.mutex.RUnlock()
+
+	lsets := []*gatewayapi.ListenerSet{}
+	for _, ls := range c.ListenerSet {
+		if target := c._gatewayRefOfListenerSet(ls); target != nil &&
+			target.Namespace == gw.Namespace && target.Name == gw.Name {
+			lsets = append(lsets, ls)
+		}
+	}
+	return lsets
+}
+
+// GatewayRefOfListenerSet resolves a ListenerSet's spec.parentRef (unlike an HTTPRoute, a
+// ListenerSet has exactly one -- it can only ever attach to one Gateway) to that Gateway object,
+// or nil if it doesn't resolve to a Gateway this cache knows about.
+func (c *SIGCache) GatewayRefOfListenerSet(ls *gatewayapi.ListenerSet) *gatewayapi.Gateway {
+	defer utils.TimeItToPrometheus()()
+
+	c.mutex.RLock()
+	defer c.mutex.RUnlock()
+
+	return c._gatewayRefOfListenerSet(ls)
+}
+
+func (c *SIGCache) _gatewayRefOfListenerSet(ls *gatewayapi.ListenerSet) *gatewayapi.Gateway {
+	if ls == nil {
+		return nil
+	}
+	pr := ls.Spec.ParentRef
+	ns := ls.Namespace
+	if pr.Namespace != nil {
+		ns = string(*pr.Namespace)
+	}
+	return c.Gateway[utils.Keyname(ns, string(pr.Name))]
+}
+
+// listenerRefersSecret reports whether listener's TLS config references scrt, checking it against
+// referrer for ReferenceGrant purposes (the Gateway itself for its own listeners, or the specific
+// ListenerSet for one it contributes -- see AttachedSecrets' identical referrer reasoning).
+func (c *SIGCache) listenerRefersSecret(listener *gatewayapi.Listener, referrer client.Object, scrt *v1.Secret) (bool, error) {
+	if listener.Protocol != gatewayapi.HTTPSProtocolType {
+		return false, nil
+	}
+	if listener.TLS == nil {
+		return false, fmt.Errorf("invalid tls setting in listener")
+	}
+	if listener.TLS.Mode != nil && *listener.TLS.Mode != gatewayapi.TLSModeTerminate {
+		return false, nil
+	}
+	for _, ref := range listener.TLS.CertificateRefs {
+		ns := referrer.GetNamespace()
+		if ref.Namespace != nil {
+			ns = string(*ref.Namespace)
+		}
+		if ns == scrt.Namespace && ref.Name == gatewayapi.ObjectName(scrt.Name) {
+			if err := validateSecretType(ref.Group, ref.Kind); err != nil {
+				return false, err
+			}
+			if !c._canRefer(referrer, scrt) {
+				return false, fmt.Errorf("'%s' cannot refer to secret '%s'",
+					utils.Keyname(referrer.GetNamespace(), referrer.GetName()), utils.Keyname(scrt.Namespace, scrt.Name))
+			}
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 func (c *SIGCache) GatewayRefsOfSecret(scrt *v1.Secret) ([]*gatewayapi.Gateway, error) {
@@ -300,81 +472,126 @@ func (c *SIGCache) GatewayRefsOfSecret(scrt *v1.Secret) ([]*gatewayapi.Gateway, 
 	gws := []*gatewayapi.Gateway{}
 
 	for _, gw := range c.Gateway {
-		for i, found := 0, false; i < len(gw.Spec.Listeners) && !found; i++ {
-			listener := gw.Spec.Listeners[i]
-			if listener.Protocol == gatewayapi.HTTPSProtocolType {
-				if listener.TLS == nil {
-					return gws, fmt.Errorf("invalid tls setting in listener")
-				}
-				if listener.TLS.Mode == nil || *listener.TLS.Mode == gatewayapi.TLSModeTerminate {
-					for _, ref := range listener.TLS.CertificateRefs {
-						ns := gw.Namespace
-						if ref.Namespace != nil {
-							ns = string(*ref.Namespace)
-						}
-						if ns == scrt.Namespace && ref.Name == gatewayapi.ObjectName(scrt.Name) {
-							if err := validateSecretType(ref.Group, ref.Kind); err == nil {
-								if !c._canRefer(gw, scrt) {
-									return gws, fmt.Errorf("'%s' cannot refer to secret '%s'",
-										utils.Keyname(gw.Namespace, gw.Name), utils.Keyname(scrt.Namespace, scrt.Name))
-								}
-								gws = append(gws, gw)
-								found = true
-								break
-							} else {
-								return gws, err
-							}
-						}
+		found := false
+		for i := 0; i < len(gw.Spec.Listeners) && !found; i++ {
+			matched, err := c.listenerRefersSecret(&gw.Spec.Listeners[i], gw, scrt)
+			if err != nil {
+				return gws, err
+			}
+			found = matched
+		}
+		// A secret referenced only by a ListenerSet's own listener (not the Gateway's own) --
+		// e.g. a per-tenant Certificate attached via ListenerSet, the common case for anything
+		// using EffectiveListeners' ListenerSet-merge support -- used to never match here, since
+		// this loop only ever checked gw.Spec.Listeners. That meant SecretReconciler resolved
+		// zero impacted Gateways for it and never triggered a redeploy on create/rotate: the cert
+		// existed and was even correctly picked up whenever some OTHER event happened to trigger
+		// a redeploy of the same class, but the secret's OWN create event did nothing on its own.
+		// Confirmed live: kasten's dedicated Certificate issued successfully, but the shared HTTPS
+		// Virtual Server kept serving the wildcard cert (the only one whose Gateway resolved here)
+		// until something unrelated forced another redeploy.
+		if !found {
+			for _, lset := range c._attachedListenerSets(gw) {
+				for i := 0; i < len(lset.Spec.Listeners) && !found; i++ {
+					matched, err := c.listenerRefersSecret(&lset.Spec.Listeners[i], lset, scrt)
+					if err != nil {
+						return gws, err
 					}
+					found = matched
+				}
+				if found {
+					break
 				}
 			}
+		}
+		if found {
+			gws = append(gws, gw)
 		}
 	}
 
 	return gws, nil
 }
 
-func (c *SIGCache) AttachedSecrets(gw *gatewayapi.Gateway) (map[string][]*v1.Secret, error) {
+// AttachedSecrets returns each listener's resolved certs (keyed by vsname, same as
+// EffectiveListeners), plus a second map naming which vsnames have at least one CertificateRef
+// that couldn't be resolved -- a secret that doesn't exist (yet) or can't be referenced. That
+// second condition is deliberately NOT an error: it's the expected, normal state of a listener
+// whose cert-manager Certificate is still being issued (Certificate -> CertificateRequest ->
+// Order -> Challenge -> Secret is not instantaneous). Confirmed live: a listener in this state
+// used to make this function return a hard error, which parseGateway propagated, which
+// ParseAllForClass propagated further -- aborting the ENTIRE GatewayClass's deployment, not just
+// the one listener with a pending cert. Every other Gateway and listener in the class silently
+// stopped receiving new changes (though nothing already deployed got wiped, thanks to
+// AS3Deployer's tenantCache seeding) until that one cert finished issuing. The caller
+// (parseGateway) uses the incomplete map to skip building a Virtual Server for a listener/group
+// that ended up with no usable cert, instead of every listener sharing its GatewayClass.
+//
+// Malformed listener config (missing spec.TLS, or a CertificateRef of the wrong Secret type) is
+// still a hard error -- those are permanent misconfigurations that retrying won't fix, unlike a
+// cert mid-issuance.
+func (c *SIGCache) AttachedSecrets(gw *gatewayapi.Gateway) (map[string][]*v1.Secret, map[string]bool, error) {
 	defer utils.TimeItToPrometheus()()
 
 	c.mutex.RLock()
 	defer c.mutex.RUnlock()
 
 	rlt := map[string][]*v1.Secret{}
+	incomplete := map[string]bool{}
 	if gw == nil {
-		return rlt, nil
+		return rlt, incomplete, nil
 	}
 
-	for _, listener := range gw.Spec.Listeners {
-		lsname := gwListenerName(gw, &listener)
-		if _, ok := rlt[lsname]; !ok {
-			rlt[lsname] = []*v1.Secret{}
+	// referrer is whichever object actually declared a given listener -- the Gateway itself
+	// for its own listeners, or the specific ListenerSet for one it contributes. This matters
+	// for cross-namespace ReferenceGrant resolution (_canRefer's "from" side): per ListenerSet's
+	// own doc comment, "ReferenceGrants applied to a Gateway are not inherited by child
+	// ListenerSets" and vice versa -- each is judged on its own namespace/identity, not the
+	// other's.
+	collect := func(vsname string, listener *gatewayapi.Listener, referrer client.Object) error {
+		if _, ok := rlt[vsname]; !ok {
+			rlt[vsname] = []*v1.Secret{}
 		}
-		if listener.Protocol == gatewayapi.HTTPSProtocolType {
-			if listener.TLS == nil {
-				return rlt, fmt.Errorf("invalid listener.TLS setting")
+		if listener.Protocol != gatewayapi.HTTPSProtocolType {
+			return nil
+		}
+		if listener.TLS == nil {
+			return fmt.Errorf("invalid listener.TLS setting")
+		}
+		if listener.TLS.Mode != nil && *listener.TLS.Mode != gatewayapi.TLSModeTerminate {
+			return nil
+		}
+		for _, ref := range listener.TLS.CertificateRefs {
+			ns := referrer.GetNamespace()
+			if ref.Namespace != nil {
+				ns = string(*ref.Namespace)
 			}
-			if listener.TLS.Mode == nil || *listener.TLS.Mode == gatewayapi.TLSModeTerminate {
-				for _, ref := range listener.TLS.CertificateRefs {
-					ns := gw.Namespace
-					if ref.Namespace != nil {
-						ns = string(*ref.Namespace)
-					}
-					n := utils.Keyname(ns, string(ref.Name))
-					scrt := c.Secret[n]
-					if scrt != nil && c._canRefer(gw, scrt) {
-						if err := validateSecretType(ref.Group, ref.Kind); err != nil {
-							return rlt, err
-						}
-						rlt[lsname] = append(rlt[lsname], scrt)
-					} else {
-						return rlt, fmt.Errorf("secret %s not exist or cannnot refer to", n)
-					}
-				}
+			n := utils.Keyname(ns, string(ref.Name))
+			scrt := c.Secret[n]
+			if scrt == nil || !c._canRefer(referrer, scrt) {
+				incomplete[vsname] = true
+				continue
+			}
+			if err := validateSecretType(ref.Group, ref.Kind); err != nil {
+				return err
+			}
+			rlt[vsname] = append(rlt[vsname], scrt)
+		}
+		return nil
+	}
+
+	for i, listener := range gw.Spec.Listeners {
+		if err := collect(gwListenerName(gw, &listener), &gw.Spec.Listeners[i], gw); err != nil {
+			return rlt, incomplete, err
+		}
+	}
+	for _, lset := range c._attachedListenerSets(gw) {
+		for i, listener := range lset.Spec.Listeners {
+			if err := collect(listenerSetEntryName(gw, lset, listener.Name), &lset.Spec.Listeners[i], lset); err != nil {
+				return rlt, incomplete, err
 			}
 		}
 	}
-	return rlt, nil
+	return rlt, incomplete, nil
 }
 
 func (c *SIGCache) AttachedHTTPRoutes(gw *gatewayapi.Gateway) []*gatewayapi.HTTPRoute {
@@ -391,11 +608,7 @@ func (c *SIGCache) _attachedHTTPRoutes(gw *gatewayapi.Gateway) []*gatewayapi.HTT
 		return []*gatewayapi.HTTPRoute{}
 	}
 
-	listeners := map[string]*gatewayapi.Listener{}
-	for _, ls := range gw.Spec.Listeners {
-		lskey := gwListenerName(gw, &ls)
-		listeners[lskey] = ls.DeepCopy()
-	}
+	listeners := c._effectiveListeners(gw)
 
 	hrs := []*gatewayapi.HTTPRoute{}
 	for _, hr := range c.HTTPRoute {
@@ -404,18 +617,211 @@ func (c *SIGCache) _attachedHTTPRoutes(gw *gatewayapi.Gateway) []*gatewayapi.HTT
 			if pr.Namespace != nil {
 				ns = string(*pr.Namespace)
 			}
-			if utils.Keyname(ns, string(pr.Name)) == utils.Keyname(gw.Namespace, gw.Name) {
-				vsname := hrParentName(hr, &pr)
-				routeNamespace := c.Namespace[hr.Namespace]
-				routetype := reflect.TypeOf(*hr).Name()
-				if RouteMatches(gw.Namespace, listeners[vsname], routeNamespace, routetype) {
-					hrs = append(hrs, hr)
-					break
+
+			// A parentRef can target gw directly, or a ListenerSet attached to it -- see
+			// _gatewayRefsOfHR's identical reasoning just above for why refNamespace (what
+			// RouteMatches treats as "the Gateway's own namespace" for AllowedRoutes' "Same"
+			// case) is the ListenerSet's own namespace, not gw's, when going through one.
+			refNamespace := ""
+			targetsGW := false
+			if pr.Kind != nil && string(*pr.Kind) == "ListenerSet" {
+				if ls := c.ListenerSet[utils.Keyname(ns, string(pr.Name))]; ls != nil {
+					if target := c._gatewayRefOfListenerSet(ls); target != nil &&
+						utils.Keyname(target.Namespace, target.Name) == utils.Keyname(gw.Namespace, gw.Name) {
+						targetsGW = true
+						refNamespace = ls.Namespace
+					}
 				}
+			} else if utils.Keyname(ns, string(pr.Name)) == utils.Keyname(gw.Namespace, gw.Name) {
+				targetsGW = true
+				refNamespace = gw.Namespace
+			}
+			if !targetsGW {
+				continue
+			}
+
+			vsname := c._hrParentName(hr, &pr)
+			routeNamespace := c.Namespace[hr.Namespace]
+			routetype := reflect.TypeOf(*hr).Name()
+			if RouteMatches(refNamespace, listeners[vsname], routeNamespace, routetype) {
+				hrs = append(hrs, hr)
+				break
 			}
 		}
 	}
+
+	// c.HTTPRoute is a map, so the range above visits routes in Go's randomized iteration order --
+	// and that order is exactly the order their generated iRules get appended onto a shared
+	// Virtual Server (see parser.go's "irules mapping: for httproutes" and the merge loop below
+	// it), which BIG-IP then runs in sequence for every request. A route with a broad match (e.g.
+	// a catch-all HTTP->HTTPS redirect matching any path under a wildcard host) landing BEFORE a
+	// more specific one (e.g. an ACME HTTP-01 solver's exact challenge-path match) means the
+	// broad rule responds first and the specific one never gets a chance, on whichever deploys
+	// happen to iterate the map that way -- confirmed live: the exact same solver route worked on
+	// one deploy and 301-redirected (never served the challenge) on the next, with no config
+	// change in between, purely from map iteration order flipping. Sorting by match specificity
+	// (routeSpecificity below) before returning makes the order the SAME every time, and makes the
+	// more specific match win, consistent with the Gateway API spec's own HTTPRoute precedence
+	// rules (exact > longer prefix > shorter prefix).
+	sort.SliceStable(hrs, func(i, j int) bool {
+		return routeSpecificity(hrs[i]) > routeSpecificity(hrs[j])
+	})
 	return hrs
+}
+
+// routeSpecificity scores an HTTPRoute for ordering multiple routes' generated iRules on a
+// shared Virtual Server so the more specific one runs first (see _attachedHTTPRoutes' own doc
+// comment on why order matters here). Hostname specificity dominates (an exact hostname always
+// outranks a wildcard one, which always outranks no hostname at all -- i.e. "matches any host"),
+// with path specificity only breaking ties between routes at the same hostname tier. Without the
+// hostname component, a wildcard-hostname catch-all (e.g. a global "page not found" route meant
+// to catch anything not matched by a real app) would sort relative to every real app's
+// exact-hostname route in Go's randomized map iteration order -- on an unlucky deploy it could
+// land BEFORE one and silently swallow that app's traffic, the exact failure mode this function
+// already exists to prevent for path matches (see the ACME solver incident in
+// _attachedHTTPRoutes' comment).
+func routeSpecificity(hr *gatewayapi.HTTPRoute) int {
+	return hostnameSpecificity(hr.Spec.Hostnames)<<40 + pathSpecificity(hr)
+}
+
+// hostnameSpecificity scores a route's most specific hostname: exact > wildcard > none (no
+// Hostnames at all means "matches any host the Gateway/listener allows", the least specific
+// case). Mirrors Gateway API's own hostname precedence rules.
+func hostnameSpecificity(hostnames []gatewayapi.Hostname) int {
+	best := 0
+	for _, h := range hostnames {
+		score := 2
+		if strings.HasPrefix(string(h), "*.") {
+			score = 1
+		}
+		if score > best {
+			best = score
+		}
+	}
+	return best
+}
+
+// pathSpecificity scores an HTTPRoute by its most specific path match. An Exact match outranks
+// any PathPrefix regardless of length; among PathPrefix matches, a longer prefix is more
+// specific. Mirrors Gateway API's own precedence rules for HTTPRoute path matches.
+func pathSpecificity(hr *gatewayapi.HTTPRoute) int {
+	best := 0
+	for _, rule := range hr.Spec.Rules {
+		for _, m := range rule.Matches {
+			if m.Path == nil {
+				continue
+			}
+			score := 0
+			switch {
+			case m.Path.Type != nil && *m.Path.Type == gatewayapi.PathMatchExact:
+				score = 1<<30 + len(strPtrVal(m.Path.Value))
+			case m.Path.Value != nil:
+				score = len(*m.Path.Value)
+			}
+			if score > best {
+				best = score
+			}
+		}
+	}
+	return best
+}
+
+func strPtrVal(s *string) string {
+	if s == nil {
+		return ""
+	}
+	return *s
+}
+
+// EffectiveListeners returns every listener that's actually part of gw's served configuration --
+// its own spec.Listeners, plus every listener contributed by a ListenerSet attached to it (see
+// AttachedListenerSets) -- keyed by the same name parseGateway and hrParentName use for that
+// listener (gwListenerName for gw's own, listenerSetEntryName for a ListenerSet's), so a route's
+// parentRef and this merged view always agree on what a given listener actually is.
+func (c *SIGCache) EffectiveListeners(gw *gatewayapi.Gateway) map[string]*gatewayapi.Listener {
+	defer utils.TimeItToPrometheus()()
+
+	c.mutex.RLock()
+	defer c.mutex.RUnlock()
+
+	return c._effectiveListeners(gw)
+}
+
+func (c *SIGCache) _effectiveListeners(gw *gatewayapi.Gateway) map[string]*gatewayapi.Listener {
+	listeners := map[string]*gatewayapi.Listener{}
+	if gw == nil {
+		return listeners
+	}
+	for i, ls := range gw.Spec.Listeners {
+		listeners[gwListenerName(gw, &ls)] = &gw.Spec.Listeners[i]
+	}
+	for _, lset := range c._attachedListenerSets(gw) {
+		for i, ls := range lset.Spec.Listeners {
+			listeners[listenerSetEntryName(gw, lset, ls.Name)] = &lset.Spec.Listeners[i]
+		}
+	}
+	return listeners
+}
+
+func (c *SIGCache) AttachedListenerSets(gw *gatewayapi.Gateway) []*gatewayapi.ListenerSet {
+	defer utils.TimeItToPrometheus()()
+
+	c.mutex.RLock()
+	defer c.mutex.RUnlock()
+
+	return c._attachedListenerSets(gw)
+}
+
+// _attachedListenerSets returns the ListenerSets that are both correctly parented to gw (their
+// spec.parentRef resolves to it) AND permitted by gw's own spec.AllowedListeners -- a Gateway
+// allows no ListenerSets by default (AllowedListeners.Namespaces.From defaults to "None"), so an
+// otherwise-correctly-parented ListenerSet in a Gateway that never opted in is NOT attached.
+// Mirrors RouteMatches' own From-namespace matching (utils.go) for the "Selector" case.
+func (c *SIGCache) _attachedListenerSets(gw *gatewayapi.Gateway) []*gatewayapi.ListenerSet {
+	if gw == nil || gw.Spec.AllowedListeners == nil || gw.Spec.AllowedListeners.Namespaces == nil {
+		return []*gatewayapi.ListenerSet{}
+	}
+	allowedNS := gw.Spec.AllowedListeners.Namespaces
+	from := gatewayapi.NamespacesFromNone
+	if allowedNS.From != nil {
+		from = *allowedNS.From
+	}
+	if from == gatewayapi.NamespacesFromNone {
+		return []*gatewayapi.ListenerSet{}
+	}
+
+	lsets := []*gatewayapi.ListenerSet{}
+	for _, ls := range c.ListenerSet {
+		pr := ls.Spec.ParentRef
+		// Namespace omitted on the parentRef means "same namespace as the referring
+		// ListenerSet" (standard Gateway API convention for parentRefs), not the target
+		// Gateway's namespace.
+		parentNS := ls.Namespace
+		if pr.Namespace != nil {
+			parentNS = string(*pr.Namespace)
+		}
+		if parentNS != gw.Namespace || string(pr.Name) != gw.Name {
+			continue
+		}
+
+		switch from {
+		case gatewayapi.NamespacesFromAll:
+			lsets = append(lsets, ls)
+		case gatewayapi.NamespacesFromSame:
+			if ls.Namespace == gw.Namespace {
+				lsets = append(lsets, ls)
+			}
+		case gatewayapi.NamespacesFromSelector:
+			selector, err := metav1.LabelSelectorAsSelector(allowedNS.Selector)
+			if err != nil {
+				continue
+			}
+			if nsObj := c.Namespace[ls.Namespace]; nsObj != nil && selector.Matches(labels.Set(nsObj.Labels)) {
+				lsets = append(lsets, ls)
+			}
+		}
+	}
+	return lsets
 }
 
 func (c *SIGCache) AttachedServices(hr *gatewayapi.HTTPRoute) []*v1.Service {
@@ -790,7 +1196,7 @@ func (c *SIGCache) syncCoreV1Resources(mgr manager.Manager) error {
 	}
 
 	if nsList, err := kubeClient.CoreV1().Namespaces().List(context.TODO(), metav1.ListOptions{}); err != nil {
-		return nil
+		return err
 	} else {
 		for _, ns := range nsList.Items {
 			slog.Debugf("found ns: %s", ns.Name)
@@ -862,13 +1268,20 @@ func (c *SIGCache) syncGatewayResources(mgr manager.Manager) error {
 		return err
 	} else {
 		for _, gwc := range gwcList.Items {
-			if gwc.Spec.ControllerName == gatewayapi.GatewayController(c.ControllerName) {
-				slog.Debugf("found gatewayclass %s", gwc.Name)
-				c.GatewayClass[gwc.Name] = gwc.DeepCopy()
-			} else {
-				msg := fmt.Sprintf("This gwc's ControllerName %s not equal to this controller. Ignore.", gwc.Spec.ControllerName)
-				slog.Debugf(msg)
-			}
+			// Cache every GatewayClass here regardless of ownership -- matches the same fix (and
+			// the same reasoning) in GatewayClassReconciler.Reconcile: ParseAllForClass and
+			// HandleBackends need to tell "not cached yet" (transient, worth retrying) apart from
+			// "cached, but belongs to a different controller" (permanent, correctly a no-op), and
+			// this upfront sync used to only cache classes this controller owns, same bug as the
+			// reconciler had -- meaning even after SyncedAtStart flipped true, a class belonging
+			// to any OTHER controller (e.g. Cilium's cilium-private/cilium-public, both present in
+			// this cluster) still wasn't cached, and anything reachable through it kept hitting
+			// "not cached yet" until that class's own later, separate watch-triggered reconcile
+			// happened to catch up. Confirmed live: the resulting retry storm coincided with (and
+			// plausibly contributed to starving) dex/argocd/mygateway/f5-tenants staying
+			// unreachable well past when SyncedAtStart itself had already gone true.
+			slog.Debugf("found gatewayclass %s", gwc.Name)
+			c.GatewayClass[gwc.Name] = gwc.DeepCopy()
 		}
 	}
 

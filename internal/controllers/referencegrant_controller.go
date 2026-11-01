@@ -71,10 +71,8 @@ func (r *ReferenceGrantReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		ncls := pkg.ActiveSIGs.RGImpactedGatewayClasses(nrg)
 		clss := utils.Unified(append(ocls, ncls...))
 		pkg.ActiveSIGs.SetReferenceGrant(nrg)
-		if err := pkg.DeployForEvent(lctx, clss); err != nil {
-			return ctrl.Result{}, nil
-		} else {
-			return ctrl.Result{}, err
-		}
+		// These two returns used to be swapped, so a failed deploy returned nil: never logged
+		// by controller-runtime and never retried.
+		return ctrl.Result{}, pkg.DeployForEvent(lctx, clss)
 	}
 }

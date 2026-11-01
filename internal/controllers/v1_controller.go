@@ -94,6 +94,21 @@ func (r *NamespaceReconciler) GetResObject() client.Object {
 }
 
 func (r *EndpointsReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+	// Missing on this reconciler and ServiceReconciler below, unlike every other one in this
+	// package (Gateway, HTTPRoute, GatewayClass, Secret, Node, Namespace, ListenerSet all check
+	// this first) -- meaning Service/Endpoints reconciles, and therefore HandleBackends, could
+	// run before informer caches were guaranteed warm, with no gate at all. Confirmed live as a
+	// real, active cause of missing content: two K8s namespaces' own backends going missing from
+	// a deploy while a third's came through fine, with zero errors logged anywhere, pointed at
+	// exactly this kind of race rather than any of the previously-fixed ones (GatewayClass
+	// caching, PendingDeploys draining) -- those explained Gateway/HTTPRoute-sourced content
+	// going missing, not Service/Endpoints-sourced content succeeding inconsistently per
+	// namespace with no error trail at all.
+	if !pkg.ActiveSIGs.SyncedAtStart {
+		<-time.After(100 * time.Millisecond)
+		return ctrl.Result{Requeue: true}, nil
+	}
+
 	lctx := pkg.NewContext()
 	var obj v1.Endpoints
 	// // too many logs.
@@ -117,6 +132,13 @@ func (r *EndpointsReconciler) GetResObject() client.Object {
 }
 
 func (r *ServiceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+	// See EndpointsReconciler's identical check just above for why this was missing and why it
+	// matters.
+	if !pkg.ActiveSIGs.SyncedAtStart {
+		<-time.After(100 * time.Millisecond)
+		return ctrl.Result{Requeue: true}, nil
+	}
+
 	var obj v1.Service
 	lctx := pkg.NewContext()
 	slog := utils.LogFromContext(lctx)
@@ -155,6 +177,11 @@ func (r *NodeReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 		}
 	} else {
 		k8s.NodeCache.Set(obj.DeepCopy())
+	}
+
+	lctx := pkg.NewContext()
+	if err := pkg.SyncNodeFDBs(lctx); err != nil {
+		return ctrl.Result{}, err
 	}
 	return ctrl.Result{}, nil
 }

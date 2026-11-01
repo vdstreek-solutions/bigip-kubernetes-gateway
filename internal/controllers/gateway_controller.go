@@ -20,6 +20,7 @@ import (
 	"context"
 	"time"
 
+	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -69,6 +70,60 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 			return ctrl.Result{}, err
 		}
 	} else {
+		key := req.NamespacedName.String()
+		// This controller's own Reconcile fires for EVERY Gateway object cluster-wide, not just
+		// ones using our GatewayClass (there's no field selector on the watch) -- confirmed live:
+		// without this check, the address-auto-assignment block below ran for Cilium's unrelated
+		// "private"/"public" Gateways too (they also leave spec.addresses empty, relying on their
+		// own LoadBalancer-based assignment instead), repeatedly overwriting their
+		// status.addresses with an address from OUR pool. Cilium's own controller kept correcting
+		// it back, and each correction is itself a status change that re-triggers our Reconcile --
+		// a self-sustaining fight, thousands of reconciles/sec, on a shared Gateway that serves
+		// many unrelated production apps. Skip entirely for a GatewayClass we don't control.
+		gwc := pkg.ActiveSIGs.GetGatewayClass(string(obj.Spec.GatewayClassName))
+		weOwnThisClass := gwc != nil && gwc.Spec.ControllerName == gatewayapi.GatewayController(pkg.ActiveSIGs.ControllerName)
+
+		// No spec.addresses is a valid, documented Gateway API pattern (see
+		// GatewayStatus.Addresses' own doc comment: "no addresses are specified,
+		// all addresses are dynamically assigned") -- this project never
+		// implemented that half, hence this block. Only acts when
+		// --address-pool-cidr is actually configured; otherwise behavior is
+		// unchanged from before (no addresses -> no Virtual Server, see parser.go).
+		if weOwnThisClass && len(obj.Spec.Addresses) == 0 {
+			// already assigned in a previous reconcile (or before a controller restart) --
+			// re-register rather than reallocate, so restarts don't change a Gateway's address
+			// out from under it. Falls through to a fresh allocation below if the existing
+			// address is no longer within the configured range (RegisterExistingAddress
+			// returns false in that case) -- see its doc comment.
+			hasValidExisting := len(obj.Status.Addresses) > 0 &&
+				pkg.RegisterExistingAddress(key, obj.Status.Addresses[0].Value)
+			if !hasValidExisting && pkg.AddressPoolConfigured() {
+				ip, err := pkg.AllocateAddress(key)
+				if err != nil {
+					slog.Errorf("failed to allocate address for %s: %s", key, err.Error())
+					return ctrl.Result{}, err
+				}
+				addrType := gatewayapi.IPAddressType
+				if err := retry.RetryOnConflict(retry.DefaultBackoff, func() error {
+					var latest gatewayapi.Gateway
+					if err := r.Client.Get(ctx, req.NamespacedName, &latest); err != nil {
+						return err
+					}
+					latest.Status.Addresses = []gatewayapi.GatewayStatusAddress{
+						{Type: &addrType, Value: ip},
+					}
+					if err := r.Client.Status().Update(ctx, &latest); err != nil {
+						return err
+					}
+					obj.Status.Addresses = latest.Status.Addresses
+					return nil
+				}); err != nil {
+					slog.Errorf("failed to write allocated address %s to %s status: %s", ip, key, err.Error())
+					return ctrl.Result{}, err
+				}
+			}
+		}
+
 		// upsert resources
 		pkg.ActiveSIGs.SetGateway(&obj)
 

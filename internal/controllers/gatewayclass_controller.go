@@ -72,6 +72,19 @@ func (r *GatewayClassReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		}
 	} else {
 		ngwc := obj.DeepCopy()
+
+		// Cache regardless of ownership, BEFORE the controllerName check below -- ParseAllForClass
+		// and HandleBackends need to tell "not cached yet" (transient, worth retrying) apart from
+		// "cached, but belongs to a different controller" (permanent, correctly a no-op). If this
+		// reconciler only ever cached classes it owns, a class belonging to ANY other controller
+		// (e.g. Cilium's cilium-private/cilium-public, both present in this cluster) would NEVER
+		// get cached -- permanently indistinguishable from "not synced yet" -- and their own
+		// retry-on-that-error fix would then retry forever instead of just once. Confirmed live:
+		// exactly this, immediately after deploying that fix ("gatewayclass [cilium-private] not
+		// cached yet" repeating every reconcile, never resolving), almost certainly starving the
+		// real f5-bigip work of the same shared workqueue in the process.
+		pkg.ActiveSIGs.SetGatewayClass(&obj)
+
 		if ngwc.Spec.ControllerName != gatewayapi.GatewayController(pkg.ActiveSIGs.ControllerName) {
 			slog.Debugf("ignore this gwc " + ngwc.Name + " as its controllerName does not match " + pkg.ActiveSIGs.ControllerName)
 			return ctrl.Result{}, nil
@@ -97,8 +110,7 @@ func (r *GatewayClassReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		// 	slog.Debugf("status updated")
 		// }
 
-		// upsert gatewayclass
-		pkg.ActiveSIGs.SetGatewayClass(&obj)
+		// already cached above (before the ownership check), so no second upsert needed here.
 		return ctrl.Result{}, pkg.DeployForEvent(lctx, []string{req.Name})
 	}
 }

@@ -1,6 +1,13 @@
-# docker build -t bigip-kubernetes-gateway:latest -f build/Dockerfile .
-FROM alpine:3.16.2
+# build/Dockerfile-controller
+FROM golang:1.27-alpine AS build
+RUN apk add --no-cache git
+WORKDIR /src
+COPY . .
+RUN go mod tidy && \
+    CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+    go build -ldflags '-s -w --extldflags "-static -fpic"' \
+    -o /out/bigip-kubernetes-gateway-controller-linux ./cmd/controller
 
-COPY ./build/bigip-kubernetes-gateway-controller-linux /
-
+FROM alpine:3.24.2
+COPY --from=build /out/bigip-kubernetes-gateway-controller-linux /
 RUN date > /build_date

@@ -64,6 +64,7 @@ func (r *HttpRouteReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 				cls = append(cls, string(gw.Spec.GatewayClassName))
 			}
 			pkg.ActiveSIGs.UnsetHTTPRoute(req.NamespacedName.String())
+			pkg.ForgetHTTPRoute(req.Namespace, req.Name)
 			return ctrl.Result{}, pkg.DeployForEvent(lctx, cls)
 		} else {
 			return ctrl.Result{}, err

@@ -5,7 +5,22 @@ when RULE_INIT {
 when HTTP_REQUEST {
 {{ if .Spec.Hostnames }}
   if { {{ orHosts "[HTTP::host] matches" .Spec.Hostnames }} }{
+    {{ $excluded := excludedHosts . }}
+    {{ if $excluded }}
+    {{/*
+      This route has a wildcard hostname, and these are the exact hostnames (from other routes
+      attached to the same Gateway) it must defer to -- see excludedHosts' own doc comment for
+      why this can't just rely on BIG-IP running this iRule after theirs on a shared Virtual
+      Server. Deliberately NOT an "else" paired with the match below: skipping RequestRules
+      entirely here just lets whatever OTHER iRule actually owns this host act on its own,
+      wherever it happens to fall in the real (not necessarily declared-order) execution chain.
+    */}}
+    if { [lsearch -exact { {{ range $excluded }}{{ . }} {{ end }} } [HTTP::host]] == -1 } {
+      {{ template "RequestRules" . }}
+    }
+    {{ else }}
     {{ template "RequestRules" . }}
+    {{ end }}
   }
 {{ else }}
   {{ template "RequestRules" . }}

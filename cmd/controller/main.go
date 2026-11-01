@@ -101,6 +101,13 @@ func main() {
 	flag.StringVar(&cmdflags.Validates, "validates", "", fmt.Sprintf("The items to validate synchronizingly, on operations "+
 		"concating multiple values with ',', valid values: %s", strings.Join(webhooks.SupportedValidatingKeys(), ",")))
 	flag.StringVar(&cmdflags.DeployMethod, "deploy-method", "as3", "The deploy method to BIG-IP for the gateway resources, valid values: as3 rest")
+	// VTEP tunnel name/partition moved to per-BIG-IP config (BIGIPConfig.Vtep, read from
+	// bigip-kubernetes-gateway-config -- overlays/<env>/configmap.yaml in fleet-platform) instead
+	// of a CLI flag here: the base Deployment is shared across environments, but the
+	// tunnel/partition genuinely differs per environment (e.g. K8S-D for dev), so it belongs in
+	// the file that's already overlaid per environment, not baked into the shared Deployment spec.
+	// See internal/pkg/nodefdb.go. AddressPoolStart/AddressPoolEnd (internal/pkg/addresspool.go) moved the same
+	// way, same reasoning -- also read from BIGIPConfig now, not a flag.
 
 	opts := zap.Options{
 		Development: true,
@@ -120,6 +127,10 @@ func main() {
 		setupLog.Error(err, "failed to setup BIG-IPs")
 		os.Exit(1)
 	}
+	if err := pkg.InitAddressPool(); err != nil {
+		setupLog.Error(err, "failed to init address pool")
+		os.Exit(1)
+	}
 	pkg.LogLevel = cmdflags.LogLevel
 	pkg.PendingDeploys, pkg.DoneDeploys = utils.NewDeployQueue(), utils.NewDeployQueue()
 	go pkg.AS3Deployer(stopCh, pkg.BIGIPs)
@@ -130,6 +141,15 @@ func main() {
 		Scheme:                 scheme,
 		Metrics:                server.Options{BindAddress: metricsAddr},
 		HealthProbeBindAddress: probeAddr,
+		// Built-in controller-runtime pprof server -- not exposed outside the cluster (no
+		// Service/Ingress points at it), only reachable via kubectl exec/port-forward, so this is
+		// safe to leave on rather than gate behind a flag. Added specifically to diagnose a
+		// recurring, still-unexplained hang in this controller's reconcile/deploy pipeline
+		// (confirmed live: reconcilers and/or AS3Deployer stop making progress entirely, cleared
+		// only by a pod restart, with no error logged) -- GET
+		// http://localhost:6060/debug/pprof/goroutine?debug=2 dumps every goroutine's current
+		// stack, which is the direct way to see where it's actually stuck.
+		PprofBindAddress:       ":6060",
 		LeaderElection:         enableLeaderElection,
 		LeaderElectionID:       "303cfed9.f5.com",
 		// LeaderElectionReleaseOnCancel defines if the leader should step down voluntarily
@@ -157,6 +177,7 @@ func main() {
 	// mgr.AddMetricsExtraHandler("/stats/", promhttp.Handler())
 	// mgr.AddMetricsExtraHandler("/runtime/", dumpRuntimeHandler())
 
+	pkg.StatusClient = mgr.GetClient()
 	setupReconcilers(mgr)
 
 	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {
@@ -228,6 +249,10 @@ func setupReconcilers(mgr manager.Manager) {
 			ObjectType: &gatewayapi.HTTPRoute{},
 			Client:     mgr.GetClient(),
 			// LogLevel:   cmdflags.LogLevel,
+		},
+		&controllers.ListenerSetReconciler{
+			ObjectType: &gatewayapi.ListenerSet{},
+			Client:     mgr.GetClient(),
 		},
 		&controllers.ReferenceGrantReconciler{
 			ObjectType: &gatewayv1beta1.ReferenceGrant{},

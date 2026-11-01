@@ -1,20 +1,35 @@
 {{ define "InitPools" }}
   {{/* Define httproute as variable hr */}}
   {{ $hr := . }}
+  {{/*
+    static:: is a single Tcl namespace shared across every iRule loaded on the box, not scoped
+    per-iRule -- RULE_INIT for each iRule still only runs once, at that iRule's own load/compile
+    time, but the array name itself has box-wide visibility. Keying it by rule index alone (e.g.
+    static::pools_0) means any two HTTPRoutes whose first rule both land at index 0 -- true for
+    every single-rule HTTPRoute, the common case -- write the SAME array. Confirmed live: dex and
+    argocd-server's HTTPRoutes both attach to f5-private's https listener, both are single-rule,
+    both generated static::pools_0, and whichever iRule (re)compiled last clobbered the other's
+    array, so dex's HTTP_REQUEST block kept its own correct host/path match but read argocd's
+    pool back out of the now-shared array -- dex traffic got served argocd's backend. Prefixing
+    with the HTTPRoute's own namespace/name makes the array name unique per-route -- poolVarPrefix
+    (not a plain tclSafeName join) because a plain join is itself ambiguous at a hyphen landing on
+    the namespace/name boundary; see its own doc comment.
+  */}}
+  {{ $poolvar := poolVarPrefix $hr }}
 
   {{ range $RuleIndex, $Rule := .Spec.Rules }}
       array unset weights *
-      array unset static::pools_{{ $RuleIndex }} *
+      array unset {{ $poolvar }}_{{ $RuleIndex }} *
       set index 0
 
       array set weights { {{ parsePoolweight $Rule.BackendRefs $hr }} }
       foreach name [array names weights] {
         for { set i 0 }  { $i < $weights($name) }  { incr i } {
-            set static::pools_{{ $RuleIndex }}($index) $name
+            set {{ $poolvar }}_{{ $RuleIndex }}($index) $name
             incr index
         }
       }
-      set static::pools_{{ $RuleIndex }}_size [array size static::pools_{{ $RuleIndex }}]
+      set {{ $poolvar }}_{{ $RuleIndex }}_size [array size {{ $poolvar }}_{{ $RuleIndex }}]
   {{ end }}
 
 {{ end }}
@@ -22,6 +37,7 @@
 {{ define "RequestRules" }}
   {{/* Define httproute as variable hr */}}
   {{ $hr := . }}
+  {{ $poolvar := poolVarPrefix $hr }}
 
   {{ range $RuleIndex, $Rule := .Spec.Rules }}
     {{/*
@@ -29,11 +45,27 @@
       so here is no `else` condition.
     */}}
     if { {{ parseMatches $Rule.Matches }} } {
+      {{ parseIPWhitelist $hr }}
+      {{ parseAuth $hr }}
       {{ parseReqFilters $Rule.Filters $hr }}
-      if { $static::pools_{{ $RuleIndex }}_size != 0 }{
-        set pool $static::pools_{{ $RuleIndex }}([expr {int(rand()*$static::pools_{{ $RuleIndex }}_size)}])
+      if { ${{ $poolvar }}_{{ $RuleIndex }}_size != 0 }{
+        set pool ${{ $poolvar }}_{{ $RuleIndex }}([expr {int(rand()*${{ $poolvar }}_{{ $RuleIndex }}_size)}])
         pool $pool
       }
+      {{/*
+        Without this, a LATER iRule on the same Virtual Server (e.g. the shared catch-all
+        HTTPS-redirect iRule, which matches any host under the domain wildcard and any path
+        starting with "/") still runs its own HTTP_REQUEST block for this same request and can
+        override the pool selection above with its own HTTP::respond -- iRules on one Virtual
+        Server all process the same event in listed order unless a rule explicitly opts out via
+        "event <name> disable" (see gwListenerName's host-filter iRule for the same mechanism,
+        scoped to a non-matching host instead of a matched one here). Confirmed live: an ACME
+        HTTP-01 solver route matched correctly and selected its pool, but the redirect iRule
+        (listed after it on http.0) ran anyway and 301'd the self-check to HTTPS, where nothing
+        served that path -- "connection reset by peer", not a missing/unattached rule as it first
+        appeared.
+      */}}
+      event HTTP_REQUEST disable
       return
     }
   {{ end }}

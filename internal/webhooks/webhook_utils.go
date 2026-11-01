@@ -124,7 +124,10 @@ func validateHTTPRouteParentRefs(hr *gatewayapi.HTTPRoute) error {
 			continue
 		} else {
 			for _, ls := range gw.Spec.Listeners {
-				if ls.Name == *pr.SectionName {
+				// SectionName is optional per the Gateway API spec (nil means "any listener") --
+				// see internal/pkg/cache.go's _gatewayRefsOfHR for the live crash this same
+				// unguarded dereference caused there.
+				if pr.SectionName == nil || ls.Name == *pr.SectionName {
 					var namespace v1.Namespace
 					err := objectFromMgrCache(hr.Namespace, &namespace)
 					if err != nil || !pkg.RouteMatches(gw.Namespace, &ls, &namespace, reflect.TypeOf(*hr).Name()) {
