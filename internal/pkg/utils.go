@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math/rand"
 	"reflect"
 	"strings"
 	"sync"
@@ -276,6 +277,7 @@ func classNamesOfGateways(gws []*gatewayapi.Gateway) []string {
 }
 
 func DeployForEvent(ctx context.Context, impactedClasses []string) error {
+	RequestPodARPSync()
 	// slog := utils.LogFromContext(ctx)
 
 	if len(impactedClasses) == 0 {
@@ -631,6 +633,7 @@ func typeAndName(s string) (string, string) {
 
 func HandleBackends(ctx context.Context, namespace string) error {
 	// slog := utils.LogFromContext(ctx)
+	RequestPodARPSync()
 
 	svcs := ActiveSIGs.GetServicesWithNamespace(namespace)
 	kn := []string{}
@@ -778,6 +781,57 @@ func ensureActiveBIGIPTarget(ctx context.Context, bip *f5_bigip.BIGIP, cfg BIGIP
 	return fmt.Errorf("neither BIG-IP management address (%s, %s) confirms itself as the active "+
 		"HA member -- refusing to deploy this round rather than guess which one to target",
 		originalURL, peerURL)
+}
+
+// AS3 runs one declaration at a time per BIG-IP, across all partitions. With several clusters'
+// controllers sharing one BIG-IP (K8S-D and K8S-T on the same pair), a POST that lands while
+// another controller's deploy is running gets "503 Configuration operation in progress". Nothing
+// re-sends a failed batch -- it only goes out again if some later event happens to touch the same
+// tenant -- so treating that 503 as a failure leaves the change unapplied and the Gateways
+// "not programmed" in the meantime. It is waited out here instead. Events arriving meanwhile pile
+// up in PendingDeploys and are merged into the next batch.
+var as3BusyBackoff = backoff{initial: 2 * time.Second, max: 30 * time.Second, budget: 5 * time.Minute}
+
+type backoff struct {
+	initial, max, budget time.Duration
+}
+
+// isAS3Busy matches the 503 assertBigipResp20X turns into a retry error. HandleRequest re-wraps
+// it with %s, and RetryErrorf mangles its own format (it passes v, not v...), so the message reads
+// "__ERROR_TO_RETRY__[503 %!!(MISSING)...". The retry mark survives, and NeedRetry finds it
+// anywhere in the text; the 503 tells it apart from the 401/404/500 that are marked too.
+func isAS3Busy(err error) bool {
+	return utils.NeedRetry(err) && strings.Contains(err.Error(), "503")
+}
+
+// deployWhenAS3Free calls deploy until it doesn't come back with AS3 busy, or b.budget is spent.
+// The wait between tries grows from b.initial to b.max and is jittered, so two controllers that
+// collided once don't keep colliding in lockstep.
+func deployWhenAS3Free(ctx context.Context, b backoff, deploy func() error) error {
+	slog := utils.LogFromContext(ctx)
+	deadline := time.Now().Add(b.budget)
+	wait := b.initial
+	for attempt := 1; ; attempt++ {
+		err := deploy()
+		if !isAS3Busy(err) {
+			if err == nil && attempt > 1 {
+				slog.Infof("AS3 deploy succeeded on attempt %d", attempt)
+			}
+			return err
+		}
+		sleep := wait/2 + time.Duration(rand.Int63n(int64(wait)))
+		if time.Now().Add(sleep).After(deadline) {
+			return fmt.Errorf("AS3 still busy after %d attempts over %s: %w", attempt, b.budget, err)
+		}
+		slog.Warnf("AS3 busy with another deployment (another controller on this BIG-IP?), "+
+			"attempt %d, retrying in %s", attempt, sleep.Round(100*time.Millisecond))
+		select {
+		case <-ctx.Done():
+			return err
+		case <-time.After(sleep):
+		}
+		wait = min(2*wait, b.max)
+	}
 }
 
 // AS3Deployer starts a goroutine for accepting DeployRequests and deploy them via AS3.
@@ -948,8 +1002,10 @@ func AS3Deployer(stopCh chan struct{}, bigips []*f5_bigip.BIGIP) {
 						continue
 					}
 				}
-				bc := &f5_bigip.BIGIPContext{Context: r.Context, BIGIP: snapshotBIGIP(bip)}
-				err := deployer.HandleRequest(bc, r)
+				err := deployWhenAS3Free(r.Context, as3BusyBackoff, func() error {
+					bc := &f5_bigip.BIGIPContext{Context: r.Context, BIGIP: snapshotBIGIP(bip)}
+					return deployer.HandleRequest(bc, r)
+				})
 				DoneDeploys.Add(deployer.DeployResponse{
 					DeployRequest: r,
 					Status:        err,

@@ -13,7 +13,8 @@
     pool back out of the now-shared array -- dex traffic got served argocd's backend. Prefixing
     with the HTTPRoute's own namespace/name makes the array name unique per-route -- poolVarPrefix
     (not a plain tclSafeName join) because a plain join is itself ambiguous at a hyphen landing on
-    the namespace/name boundary; see its own doc comment.
+    the namespace/name boundary; see its own doc comment. It also includes the partition, because
+    other clusters' controllers on the same BIG-IP generate the same route names.
   */}}
   {{ $poolvar := poolVarPrefix $hr }}
 

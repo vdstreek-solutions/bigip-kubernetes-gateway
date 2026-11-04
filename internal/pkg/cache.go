@@ -76,6 +76,17 @@ func (c *SIGCache) GetGatewayClass(keyname string) *gatewayapi.GatewayClass {
 	return c.GatewayClass[keyname]
 }
 
+func (c *SIGCache) AllGatewayClasses() []*gatewayapi.GatewayClass {
+	c.mutex.RLock()
+	defer c.mutex.RUnlock()
+
+	gwcs := []*gatewayapi.GatewayClass{}
+	for _, gwc := range c.GatewayClass {
+		gwcs = append(gwcs, gwc)
+	}
+	return gwcs
+}
+
 func (c *SIGCache) SetGateway(obj *gatewayapi.Gateway) {
 	c.mutex.Lock()
 	defer c.mutex.Unlock()

@@ -279,7 +279,7 @@ flowchart TD
 
 After a route matches, its iRule disables `HTTP_REQUEST` for the remaining iRules. Later iRules, such as a catch-all HTTPS redirect, therefore can't override the pool it chose.
 
-Weighted pools are built in `RULE_INIT`. Each rule gets a Tcl array with one entry per weight unit, and the array name is prefixed with the HTTPRoute's namespace and name. The prefix matters because `static::` variables are shared across every iRule on the box.
+Weighted pools are built in `RULE_INIT`. Each rule gets a Tcl array with one entry per weight unit, and the array name is prefixed with the route's partition, namespace and name (`static::pools_pK8S_2dD_ns6_argocd_argocd_server_0`). The prefix matters because `static::` variables are shared across every iRule on the box, including those of other clusters' controllers on the same BIG-IP. Without the partition, dev and tst wrote the same arrays for their identical routes, and one cluster's virtual servers sent traffic to the other cluster's pools.
 
 ## The AS3 deployer
 
@@ -300,6 +300,8 @@ flowchart TD
     LOOP --> HA["ensureActiveBIGIPTarget<br/>(only if peerIpAddress is set)"]
     HA -- "no unit confirms ACTIVE" --> SKIP["Skip this BIG-IP for this round"]
     HA -- ok --> POST["POST AS3 declaration"]
+    POST -- "503 AS3 busy" --> WAIT["Wait 2s → 30s, jittered<br/>(up to 5 min)"]
+    WAIT --> POST
     POST & SKIP --> DONE[["DoneDeploys → RespHandler logs result"]]
     DONE --> OK{"All BIG-IPs succeeded?"}
     OK -- yes --> UPD["tenantCache[tenant] = declared content"]
@@ -314,6 +316,7 @@ Each step guards against a specific failure:
 - **Seeding from `tenantCache`.** Each event only knows its own slice of a tenant: one namespace's pools, or one class's virtual servers. AS3 replaces everything in a declared tenant, so posting a single slice would delete every other app in that partition. Seeding from the last good state prevents that.
 - **The removal guard.** It catches a declaration that is valid but incomplete before it wipes a tenant.
 - **Not clearing the cache on failure.** If one deploy fails, the next small event still merges onto the full previous state.
+- **Waiting out a busy AS3.** AS3 handles one declaration at a time per BIG-IP, across all partitions. When another controller shares the BIG-IP (for example dev and tst writing `K8S-D` and `K8S-T`), a POST can get `503 Configuration operation in progress`. Nothing re-sends a failed batch, so the deployer retries the POST itself, logging a warning each time, with backoff and jitter so two controllers don't keep colliding in step. New events queue up meanwhile and go out merged in the next batch. After 5 minutes it gives up and reports the failure.
 
 There is a known trade-off. Because of the seeding, a deleted app's pool or virtual server can remain on BIG-IP as an orphan until a full recompute of that tenant. This was chosen on purpose: an unused orphan pool is less harmful than an emptied VIP.
 
@@ -388,6 +391,17 @@ sequenceDiagram
 ```
 
 Every call sends the complete desired set, not a diff, so the records repair themselves. This uses iControl REST directly, not AS3. The tunnel, self IP and routes are created by hand on BIG-IP. The controller only maintains the FDB records.
+
+### Pod ARP entries
+
+The FDB alone isn't enough. When BIG-IP ARPs for a pod over the tunnel it learns the pod's own MAC, which is in no FDB record, so it floods every packet for that pod to every node. The pod then gets each SYN once per node, answers each copy, and BIG-IP resets the replies it doesn't expect: health checks flap and client connections are reset at random.
+
+`PodARPSyncer` therefore keeps a static ARP entry for every pool member: pod IP → `0a:0a:<hex of its node's IP>`, the same MAC as that node's FDB record, so BIG-IP sends each packet straight to the node hosting the pod. This is the same pairing F5 CIS uses.
+
+- Entries are named `k8s-pod-<pod IP>` and live in `vtep.tunnelPartition`. Only entries with that prefix in that partition are changed or removed, so other clusters' partitions and entries made by hand are left alone.
+- Pool members are the ready Endpoints addresses of ClusterIP Services used by this controller's routes. Pods on the host network are skipped: BIG-IP reaches node IPs without the tunnel.
+- Service, Endpoints, route, Gateway and node changes trigger a sync, debounced by 2 seconds. A full resync also runs every 5 minutes. Each pass reads the partition's ARP entries from BIG-IP and writes only the difference.
+- It waits for the initial cache sync, so a restart doesn't remove entries for pods that simply haven't been cached yet.
 
 When Cilium VTEP is used, also set `backendSnatAddress` to the tunnel's self IP. With SNAT automap, BIG-IP may source backend connections from a self IP outside the tunnel's CIDR. Cilium drops the return traffic for those connections, and they reset after about 12 seconds.
 

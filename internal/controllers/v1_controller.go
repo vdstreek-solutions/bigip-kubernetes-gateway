@@ -180,6 +180,8 @@ func (r *NodeReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	}
 
 	lctx := pkg.NewContext()
+	// A node's IP (and so its FDB MAC) changing moves every pod on it to a new ARP target.
+	pkg.RequestPodARPSync()
 	if err := pkg.SyncNodeFDBs(lctx); err != nil {
 		return ctrl.Result{}, err
 	}

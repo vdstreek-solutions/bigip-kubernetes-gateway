@@ -65,8 +65,33 @@ func tclSafeName(s string) string {
 // delimiter ambiguity for any variable-length string. Confirmed live once already for the
 // rule-index-only version of this array name (see this file's history) -- namespace/name made it
 // unique per-route, but not yet unambiguous at the hyphen boundary.
+//
+// It also starts with the route's partition. static:: is shared by every iRule on the BIG-IP, not
+// just this controller's, so two clusters on one BIG-IP with the same HTTPRoute (dev and tst both
+// have argocd/argocd-server) wrote the same array, and whichever iRule loaded last won. Confirmed
+// live: K8S-D's virtual server sent requests to a K8S-T pool, whose tst pod dev's tunnel can't
+// reach, and the client got a reset after "{peer} TCP retransmit timeout".
 func poolVarPrefix(hr *gatewayapi.HTTPRoute) string {
-	return fmt.Sprintf("static::pools_ns%d_%s_%s", len(hr.Namespace), tclSafeName(hr.Namespace), tclSafeName(hr.Name))
+	return fmt.Sprintf("static::pools_p%s_ns%d_%s_%s", tclEscape(ResolvePartition(hr.Namespace)),
+		len(hr.Namespace), tclSafeName(hr.Namespace), tclSafeName(hr.Name))
+}
+
+// tclEscape makes any string Tcl-variable-safe without losing information, unlike tclSafeName:
+// a partition name may contain both '-' and '_', so "K8S-D" and "K8S_D" must not end up the same.
+// Every character other than a letter or digit becomes '_' plus two hex digits ("K8S-D" ->
+// "K8S_2dD"). The result never contains "_n", so it can't run into the "_ns" that follows it.
+func tclEscape(s string) string {
+	var b strings.Builder
+	for _, r := range s {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') {
+			b.WriteRune(r)
+		} else {
+			for _, c := range []byte(string(r)) {
+				fmt.Fprintf(&b, "_%02x", c)
+			}
+		}
+	}
+	return b.String()
 }
 
 // excludedHosts returns every EXACT hostname (e.g. "dex.kubernetes-dev.wurnet.nl") from another

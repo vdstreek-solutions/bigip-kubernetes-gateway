@@ -135,6 +135,7 @@ func main() {
 	pkg.PendingDeploys, pkg.DoneDeploys = utils.NewDeployQueue(), utils.NewDeployQueue()
 	go pkg.AS3Deployer(stopCh, pkg.BIGIPs)
 	go pkg.RespHandler(stopCh)
+	go pkg.PodARPSyncer(stopCh)
 
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
 	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{

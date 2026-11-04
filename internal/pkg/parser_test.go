@@ -2,6 +2,7 @@ package pkg
 
 import (
 	"encoding/json"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -261,5 +262,52 @@ func Test_poolNamesDoNotCollideAcrossNamespaces(t *testing.T) {
 		if got != want {
 			t.Errorf("parsePoolweight for %s: got %q, want %q", ns, got, want)
 		}
+	}
+}
+
+func Test_tclEscape(t *testing.T) {
+	for in, want := range map[string]string{"K8S-D": "K8S_2dD", "K8S_D": "K8S_5fD", "Common": "Common", "a.b": "a_2eb"} {
+		if got := tclEscape(in); got != want {
+			t.Errorf("tclEscape(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+// Two clusters on one BIG-IP with the same HTTPRoute must not share the iRule's static:: pool
+// array: it is global to the box, and the last iRule loaded would decide the pool for both.
+func Test_poolVarsDoNotCollideAcrossPartitions(t *testing.T) {
+	cache, cleanup := setupTestClass(t)
+	defer cleanup()
+	hr := testRoute("argocd-server", "gw", nil)
+	cache(testGateway("gw", httpListener("http", 80)), hr)
+
+	savedConfigs := BIPConfigs
+	defer func() { BIPConfigs = savedConfigs }()
+
+	staticVar := regexp.MustCompile(`static::pools_\w+`)
+	vars := map[string]string{}
+	for _, partition := range []string{"K8S-D", "K8S-T"} {
+		BIPConfigs = BIGIPConfigs{{Partition: partition}}
+		rlt := map[string]interface{}{}
+		if err := parseiRulesFrom(testClass, hr, rlt); err != nil {
+			t.Fatal(err)
+		}
+		irule := rlt["ltm/rule/"+hrName(hr)].(map[string]interface{})["iRule"].(string)
+		names := map[string]bool{}
+		for _, v := range staticVar.FindAllString(irule, -1) {
+			names[strings.TrimSuffix(strings.TrimSuffix(v, "_size"), "_0")] = true
+		}
+		if len(names) != 1 {
+			t.Fatalf("%s: want one pool array prefix used throughout the iRule, got %v", partition, names)
+		}
+		for n := range names {
+			vars[partition] = n
+		}
+	}
+	if vars["K8S-D"] == vars["K8S-T"] {
+		t.Fatalf("K8S-D and K8S-T share static pool array %s", vars["K8S-D"])
+	}
+	if !strings.Contains(vars["K8S-D"], "K8S_2dD") {
+		t.Errorf("expected the partition in the array name, got %s", vars["K8S-D"])
 	}
 }
